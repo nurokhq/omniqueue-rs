@@ -619,6 +619,76 @@ async fn test_deadletter_config_order() {
     }
 }
 
+/// Seeds `count` entries at explicit old stream IDs (`1-0`..`count-0`, i.e. ~1970)
+/// directly via a client, in a single pipeline. All are far below any realistic
+/// `MINID` floor, so an `XADD … MINID ~ <floor>` evicts the complete old macro nodes.
+async fn seed_old_entries(conn: &mut impl redis::aio::ConnectionLike, stream: &str, count: u64) {
+    let mut pipe = redis::pipe();
+    for i in 1..=count {
+        pipe.xadd(
+            stream,
+            format!("{i}-0"),
+            &[
+                ("payload", b"old".as_ref()),
+                ("num_receives", b"0".as_ref()),
+            ],
+        )
+        .ignore();
+    }
+    let _: () = pipe.query_async(conn).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_retention_trims_old_entries_on_publish() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    seed_old_entries(&mut conn, &stream_name, 500).await;
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: None,
+        sentinel_config: None,
+        retention: Some(Duration::from_secs(1)),
+    };
+
+    let (_drop, p) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config)
+            .build_producer()
+            .await
+            .unwrap(),
+    );
+
+    p.send_raw(b"new").await.unwrap();
+
+    // The oldest seeded entry sits in a fully-expired macro node -> evicted.
+    let old: redis::streams::StreamRangeReply =
+        conn.xrange(&stream_name, "1-0", "1-0").await.unwrap();
+    assert!(old.ids.is_empty(), "old entry 1-0 should have been trimmed");
+
+    // Trimming happened (we seeded 500) and the new entry survives.
+    let len: usize = conn.xlen(&stream_name).await.unwrap();
+    assert!((1..500).contains(&len), "expected trim, got XLEN={len}");
+}
+
 // A message without a `num_receives` field shouldn't
 // cause issues:
 #[tokio::test]

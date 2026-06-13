@@ -1,6 +1,6 @@
 //! Implementation of the main queue using redis streams.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bb8::ManageConnection;
 use redis::{
@@ -22,6 +22,47 @@ use crate::{queue::Acker, Delivery, QueueError, Result};
 const GENERATE_STREAM_ID: &str = "*";
 /// Special ID for XREADGROUP commands which reads any new messages
 const LISTEN_STREAM_ID: &str = ">";
+/// Trim keyword for `XADD … MINID`.
+const MINID: &str = "MINID";
+/// Approximate-trim modifier (`~`): node-granular, amortized O(1).
+const APPROX: &str = "~";
+const NUM_RECEIVES: &str = "num_receives";
+
+/// Computes the `MINID` floor for a retention window: `now_ms − retention_ms`,
+/// saturating at 0 so a pre-epoch or unreadable clock yields a no-op trim
+/// rather than panicking.
+fn minid_floor(retention: Duration) -> u64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    now_ms.saturating_sub(retention.as_millis()) as u64
+}
+
+/// Appends one `XADD` record onto `cmd`:
+/// `key [MINID ~ <floor>] * <payload_key> <payload> num_receives <n>`.
+///
+/// Built on a `redis::Cmd` so the same layout serves a single command
+/// (`Cmd::query_async`) and, later, pipelined appends (`Pipeline::add_command`).
+/// `internal` is passed by reference so `num_receives` is preserved (0 for fresh
+/// sends, the original count on reinsert) — never hardcoded.
+fn push_xadd(
+    cmd: &mut redis::Cmd,
+    key: &str,
+    payload_key: &str,
+    internal: &InternalPayload<'_>,
+    retention: Option<Duration>,
+) {
+    cmd.arg(key);
+    if let Some(retention) = retention {
+        cmd.arg(MINID).arg(APPROX).arg(minid_floor(retention));
+    }
+    cmd.arg(GENERATE_STREAM_ID)
+        .arg(payload_key)
+        .arg(internal.payload)
+        .arg(NUM_RECEIVES)
+        .arg(internal.num_receives);
+}
 
 /// The maximum number of pending messages to reinsert into the queue after
 /// becoming stale per loop
@@ -44,21 +85,20 @@ pub(super) async fn send_raw<R: RedisConnection>(
     producer: &RedisProducer<R>,
     payload: &[u8],
 ) -> Result<()> {
-    producer
-        .redis
-        .get()
+    let mut conn = producer.redis.get().await.map_err(QueueError::generic)?;
+    let mut cmd = redis::cmd("XADD");
+    push_xadd(
+        &mut cmd,
+        &producer.queue_key,
+        producer.payload_key.as_str(),
+        &InternalPayload::new(payload),
+        producer.retention,
+    );
+    let _: () = cmd
+        .query_async(&mut *conn)
         .await
-        .map_err(QueueError::generic)?
-        .xadd(
-            &producer.queue_key,
-            GENERATE_STREAM_ID,
-            internal_to_stream_payload!(
-                InternalPayload::new(payload),
-                producer.payload_key.as_str()
-            ),
-        )
-        .await
-        .map_err(QueueError::generic)
+        .map_err(QueueError::generic)?;
+    Ok(())
 }
 
 pub(super) async fn receive<R: RedisConnection>(consumer: &RedisConsumer<R>) -> Result<Delivery> {
@@ -123,8 +163,6 @@ pub(super) async fn receive_all<R: RedisConnection>(
     }
     Ok(out)
 }
-
-const NUM_RECEIVES: &str = "num_receives";
 
 fn internal_from_stream(stream_id: &StreamId, payload_key: &str) -> Result<InternalPayloadOwned> {
     let StreamId { map, .. } = stream_id;

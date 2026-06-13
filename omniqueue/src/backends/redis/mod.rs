@@ -453,6 +453,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
                 use_redis_streams: self.use_redis_streams,
                 _background_tasks: background_tasks.clone(),
                 dlq_config: self.config.dlq_config.clone(),
+                retention: self.config.retention,
             },
             RedisConsumer {
                 redis,
@@ -485,6 +486,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
             use_redis_streams: self.use_redis_streams,
             _background_tasks,
             dlq_config: self.config.dlq_config,
+            retention: self.config.retention,
         })
     }
 
@@ -709,6 +711,7 @@ pub struct RedisProducer<M: ManageConnection> {
     use_redis_streams: bool,
     _background_tasks: Arc<JoinSet<Result<()>>>,
     dlq_config: Option<DeadLetterQueueConfig>,
+    retention: Option<Duration>,
 }
 
 impl<R: RedisConnection> RedisProducer<R> {
