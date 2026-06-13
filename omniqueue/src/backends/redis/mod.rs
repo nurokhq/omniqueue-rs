@@ -577,6 +577,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
                 self.config.ack_deadline_ms,
                 self.config.payload_key.to_owned(),
                 self.config.dlq_config.clone(),
+                self.config.retention,
             ));
         } else {
             join_set.spawn(fallback::background_task_processing(

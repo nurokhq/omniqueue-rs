@@ -69,18 +69,6 @@ fn push_xadd(
 // FIXME(onelson): expose in config?
 const PENDING_BATCH_SIZE: usize = 1000;
 
-macro_rules! internal_to_stream_payload {
-    ($internal_payload:expr, $payload_key:expr) => {
-        &[
-            ($payload_key, $internal_payload.payload),
-            (
-                NUM_RECEIVES,
-                $internal_payload.num_receives.to_string().as_bytes(),
-            ),
-        ]
-    };
-}
-
 pub(super) async fn send_raw<R: RedisConnection>(
     producer: &RedisProducer<R>,
     payload: &[u8],
@@ -324,6 +312,9 @@ impl FromRedisValue for StreamAutoclaimReply {
 
 /// Scoops up messages that have been claimed but not handled by a deadline,
 /// then re-queues them.
+// Module-private background task whose args mirror the config fields forwarded at
+// spawn time; a wrapper struct would add indirection without improving clarity.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn background_task_pending<R: RedisConnection>(
     pool: bb8::Pool<R>,
     queue_key: String,
@@ -332,6 +323,7 @@ pub(super) async fn background_task_pending<R: RedisConnection>(
     ack_deadline_ms: i64,
     payload_key: String,
     dlq_config: Option<DeadLetterQueueConfig>,
+    retention: Option<Duration>,
 ) -> Result<()> {
     loop {
         if let Err(err) = reenqueue_timed_out_messages(
@@ -342,6 +334,7 @@ pub(super) async fn background_task_pending<R: RedisConnection>(
             ack_deadline_ms,
             &payload_key,
             &dlq_config,
+            retention,
         )
         .await
         {
@@ -391,6 +384,9 @@ async fn send_to_dlq<R: RedisConnection>(
     Ok(())
 }
 
+// Called only from background_task_pending and shares its argument list by
+// necessity; extracting a params struct is out of scope for this change.
+#[allow(clippy::too_many_arguments)]
 async fn reenqueue_timed_out_messages<R: RedisConnection>(
     pool: &bb8::Pool<R>,
     main_queue_name: &str,
@@ -399,6 +395,7 @@ async fn reenqueue_timed_out_messages<R: RedisConnection>(
     ack_deadline_ms: i64,
     payload_key: &str,
     dlq_config: &Option<DeadLetterQueueConfig>,
+    retention: Option<Duration>,
 ) -> Result<()> {
     let mut conn = pool.get().await.map_err(QueueError::generic)?;
 
@@ -445,17 +442,13 @@ async fn reenqueue_timed_out_messages<R: RedisConnection>(
                     continue;
                 }
             }
-            let _ = pipe.xadd(
-                main_queue_name,
-                GENERATE_STREAM_ID,
-                internal_to_stream_payload!(
-                    InternalPayload {
-                        payload: payload.as_slice(),
-                        num_receives
-                    },
-                    payload_key
-                ),
-            );
+            let internal = InternalPayload {
+                payload: payload.as_slice(),
+                num_receives,
+            };
+            let mut cmd = redis::cmd("XADD");
+            push_xadd(&mut cmd, main_queue_name, payload_key, &internal, retention);
+            pipe.add_command(cmd);
         }
 
         let _: () = pipe
