@@ -270,6 +270,12 @@ pub struct RedisConfig {
     pub ack_deadline_ms: i64,
     pub dlq_config: Option<DeadLetterQueueConfig>,
     pub sentinel_config: Option<SentinelConfig>,
+    /// Opt-in, per-queue time-based retention window for the Redis **Streams**
+    /// backend. When `Some`, every append to the main queue carries an atomic
+    /// `XADD … MINID ~ <now − retention>` clause so entries age out
+    /// automatically. `None` preserves the untrimmed behavior bit-for-bit.
+    /// Ignored by the list/fallback backend (`RPUSH` has no `MINID`).
+    pub retention: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -447,6 +453,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
                 use_redis_streams: self.use_redis_streams,
                 _background_tasks: background_tasks.clone(),
                 dlq_config: self.config.dlq_config.clone(),
+                retention: self.config.retention,
             },
             RedisConsumer {
                 redis,
@@ -479,6 +486,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
             use_redis_streams: self.use_redis_streams,
             _background_tasks,
             dlq_config: self.config.dlq_config,
+            retention: self.config.retention,
         })
     }
 
@@ -530,6 +538,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
                 let delayed_lock_key = self.config.delayed_lock_key.to_owned();
                 let payload_key = self.config.payload_key.to_owned();
                 let use_redis_streams = self.use_redis_streams;
+                let retention = self.config.retention;
 
                 #[rustfmt::skip]
                 debug!(
@@ -546,6 +555,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
                             &delayed_lock_key,
                             &payload_key,
                             use_redis_streams,
+                            retention,
                         )
                         .await
                         {
@@ -567,6 +577,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
                 self.config.ack_deadline_ms,
                 self.config.payload_key.to_owned(),
                 self.config.dlq_config.clone(),
+                self.config.retention,
             ));
         } else {
             join_set.spawn(fallback::background_task_processing(
@@ -620,6 +631,7 @@ async fn background_task_delayed<R: RedisConnection>(
     delayed_lock: &str,
     payload_key: &str,
     use_redis_streams: bool,
+    retention: Option<Duration>,
 ) -> Result<()> {
     const BATCH_SIZE: isize = 50;
 
@@ -666,8 +678,14 @@ async fn background_task_delayed<R: RedisConnection>(
             );
 
             if use_redis_streams {
-                streams::add_to_main_queue(new_keys, main_queue_name, payload_key, &mut *conn)
-                    .await?;
+                streams::add_to_main_queue(
+                    new_keys,
+                    main_queue_name,
+                    payload_key,
+                    &mut *conn,
+                    retention,
+                )
+                .await?;
             } else {
                 fallback::add_to_main_queue(new_keys, main_queue_name, &mut *conn).await?;
             }
@@ -703,6 +721,7 @@ pub struct RedisProducer<M: ManageConnection> {
     use_redis_streams: bool,
     _background_tasks: Arc<JoinSet<Result<()>>>,
     dlq_config: Option<DeadLetterQueueConfig>,
+    retention: Option<Duration>,
 }
 
 impl<R: RedisConnection> RedisProducer<R> {
@@ -788,6 +807,7 @@ impl<R: RedisConnection> RedisProducer<R> {
                     &self.queue_key,
                     &self.payload_key,
                     &mut *conn,
+                    self.retention,
                 )
                 .await?;
             } else {

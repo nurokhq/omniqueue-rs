@@ -1,6 +1,6 @@
 //! Implementation of the main queue using redis streams.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bb8::ManageConnection;
 use redis::{
@@ -22,43 +22,74 @@ use crate::{queue::Acker, Delivery, QueueError, Result};
 const GENERATE_STREAM_ID: &str = "*";
 /// Special ID for XREADGROUP commands which reads any new messages
 const LISTEN_STREAM_ID: &str = ">";
+/// Trim keyword for `XADD … MINID`.
+const MINID: &str = "MINID";
+/// Approximate-trim modifier (`~`): node-granular, amortized O(1).
+const APPROX: &str = "~";
+const NUM_RECEIVES: &str = "num_receives";
+
+/// Computes the `MINID` floor for a retention window: `now_ms − retention_ms`,
+/// saturating at 0 so a pre-epoch or unreadable clock yields a no-op trim
+/// rather than panicking.
+fn minid_floor(retention: Duration) -> u64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    now_ms.saturating_sub(retention.as_millis()) as u64
+}
+
+/// Appends one `XADD` record onto `cmd`:
+/// `key [MINID ~ <floor>] * <payload_key> <payload> num_receives <n>`.
+///
+/// `minid` is the precomputed [`minid_floor`] (or `None` to skip trimming).
+/// Callers compute it once per send/batch rather than per record, so a pipeline
+/// of N appends does not invoke the clock N times. Built on a `redis::Cmd` so
+/// the same layout serves a single command (`Cmd::query_async`) and pipelined
+/// appends (`Pipeline::add_command`). `internal` is passed by reference so
+/// `num_receives` is preserved (0 for fresh sends, the original count on
+/// reinsert) — never hardcoded.
+fn push_xadd(
+    cmd: &mut redis::Cmd,
+    key: &str,
+    payload_key: &str,
+    internal: &InternalPayload<'_>,
+    minid: Option<u64>,
+) {
+    cmd.arg(key);
+    if let Some(minid) = minid {
+        cmd.arg(MINID).arg(APPROX).arg(minid);
+    }
+    cmd.arg(GENERATE_STREAM_ID)
+        .arg(payload_key)
+        .arg(internal.payload)
+        .arg(NUM_RECEIVES)
+        .arg(internal.num_receives);
+}
 
 /// The maximum number of pending messages to reinsert into the queue after
 /// becoming stale per loop
 // FIXME(onelson): expose in config?
 const PENDING_BATCH_SIZE: usize = 1000;
 
-macro_rules! internal_to_stream_payload {
-    ($internal_payload:expr, $payload_key:expr) => {
-        &[
-            ($payload_key, $internal_payload.payload),
-            (
-                NUM_RECEIVES,
-                $internal_payload.num_receives.to_string().as_bytes(),
-            ),
-        ]
-    };
-}
-
 pub(super) async fn send_raw<R: RedisConnection>(
     producer: &RedisProducer<R>,
     payload: &[u8],
 ) -> Result<()> {
-    producer
-        .redis
-        .get()
+    let mut conn = producer.redis.get().await.map_err(QueueError::generic)?;
+    let mut cmd = redis::cmd("XADD");
+    push_xadd(
+        &mut cmd,
+        &producer.queue_key,
+        producer.payload_key.as_str(),
+        &InternalPayload::new(payload),
+        producer.retention.map(minid_floor),
+    );
+    let _: () = cmd
+        .query_async(&mut *conn)
         .await
-        .map_err(QueueError::generic)?
-        .xadd(
-            &producer.queue_key,
-            GENERATE_STREAM_ID,
-            internal_to_stream_payload!(
-                InternalPayload::new(payload),
-                producer.payload_key.as_str()
-            ),
-        )
-        .await
-        .map_err(QueueError::generic)
+        .map_err(QueueError::generic)?;
+    Ok(())
 }
 
 pub(super) async fn receive<R: RedisConnection>(consumer: &RedisConsumer<R>) -> Result<Delivery> {
@@ -123,8 +154,6 @@ pub(super) async fn receive_all<R: RedisConnection>(
     }
     Ok(out)
 }
-
-const NUM_RECEIVES: &str = "num_receives";
 
 fn internal_from_stream(stream_id: &StreamId, payload_key: &str) -> Result<InternalPayloadOwned> {
     let StreamId { map, .. } = stream_id;
@@ -245,18 +274,19 @@ pub(super) async fn add_to_main_queue(
     main_queue_name: &str,
     payload_key: &str,
     conn: &mut impl redis::aio::ConnectionLike,
+    retention: Option<Duration>,
 ) -> Result<()> {
     let mut pipe = redis::pipe();
+    // Compute the trim floor once for the whole batch, not per entry.
+    let minid = retention.map(minid_floor);
     // We don't care about existing `num_receives`
     // since we're pushing onto a different queue.
     for InternalPayload { payload, .. } in keys {
         // So reset it to avoid carrying state over:
         let internal = InternalPayload::new(payload);
-        let _ = pipe.xadd(
-            main_queue_name,
-            GENERATE_STREAM_ID,
-            internal_to_stream_payload!(internal, payload_key),
-        );
+        let mut cmd = redis::cmd("XADD");
+        push_xadd(&mut cmd, main_queue_name, payload_key, &internal, minid);
+        pipe.add_command(cmd);
     }
 
     let _: () = pipe.query_async(conn).await.map_err(QueueError::generic)?;
@@ -287,6 +317,9 @@ impl FromRedisValue for StreamAutoclaimReply {
 
 /// Scoops up messages that have been claimed but not handled by a deadline,
 /// then re-queues them.
+// Module-private background task whose args mirror the config fields forwarded at
+// spawn time; a wrapper struct would add indirection without improving clarity.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn background_task_pending<R: RedisConnection>(
     pool: bb8::Pool<R>,
     queue_key: String,
@@ -295,6 +328,7 @@ pub(super) async fn background_task_pending<R: RedisConnection>(
     ack_deadline_ms: i64,
     payload_key: String,
     dlq_config: Option<DeadLetterQueueConfig>,
+    retention: Option<Duration>,
 ) -> Result<()> {
     loop {
         if let Err(err) = reenqueue_timed_out_messages(
@@ -305,6 +339,7 @@ pub(super) async fn background_task_pending<R: RedisConnection>(
             ack_deadline_ms,
             &payload_key,
             &dlq_config,
+            retention,
         )
         .await
         {
@@ -354,6 +389,9 @@ async fn send_to_dlq<R: RedisConnection>(
     Ok(())
 }
 
+// Called only from background_task_pending and shares its argument list by
+// necessity; extracting a params struct is out of scope for this change.
+#[allow(clippy::too_many_arguments)]
 async fn reenqueue_timed_out_messages<R: RedisConnection>(
     pool: &bb8::Pool<R>,
     main_queue_name: &str,
@@ -362,6 +400,7 @@ async fn reenqueue_timed_out_messages<R: RedisConnection>(
     ack_deadline_ms: i64,
     payload_key: &str,
     dlq_config: &Option<DeadLetterQueueConfig>,
+    retention: Option<Duration>,
 ) -> Result<()> {
     let mut conn = pool.get().await.map_err(QueueError::generic)?;
 
@@ -383,13 +422,31 @@ async fn reenqueue_timed_out_messages<R: RedisConnection>(
         trace!("Moving {} unhandled messages back to the queue", ids.len());
 
         let mut pipe = redis::pipe();
+        // Compute the trim floor once for the whole batch, not per entry.
+        let minid = retention.map(minid_floor);
 
         // And reinsert the map of KV pairs into the MAIN queue with a new stream ID
         for stream_id in &ids {
             let InternalPayloadOwned {
                 payload,
                 num_receives,
-            } = internal_from_stream(stream_id, payload_key)?;
+            } = match internal_from_stream(stream_id, payload_key) {
+                Ok(internal) => internal,
+                // The entry has no fields — it was trimmed (e.g. by a retention
+                // `MINID` append) while still pending. Skip the reinsert; the
+                // trailing XACK/XDEL below still clears its PEL ref so the group
+                // doesn't get stuck re-claiming a vanished entry. Redis 7.0+
+                // drops such entries from XAUTOCLAIM automatically; this also
+                // guards 6.2, which does not.
+                Err(QueueError::NoData) => {
+                    trace!(
+                        entry_id = stream_id.id,
+                        "pending entry trimmed; dropping stale PEL ref"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             if let Some(dlq_config) = &dlq_config {
                 if num_receives >= dlq_config.max_receives {
@@ -408,17 +465,13 @@ async fn reenqueue_timed_out_messages<R: RedisConnection>(
                     continue;
                 }
             }
-            let _ = pipe.xadd(
-                main_queue_name,
-                GENERATE_STREAM_ID,
-                internal_to_stream_payload!(
-                    InternalPayload {
-                        payload: payload.as_slice(),
-                        num_receives
-                    },
-                    payload_key
-                ),
-            );
+            let internal = InternalPayload {
+                payload: payload.as_slice(),
+                num_receives,
+            };
+            let mut cmd = redis::cmd("XADD");
+            push_xadd(&mut cmd, main_queue_name, payload_key, &internal, minid);
+            pipe.add_command(cmd);
         }
 
         let _: () = pipe

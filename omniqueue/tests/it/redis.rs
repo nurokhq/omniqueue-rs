@@ -88,6 +88,7 @@ async fn make_test_queue<R: RedisConnection>(
             redis_password: None,
             redis_use_resp3: true,
         }),
+        retention: None,
     };
 
     (
@@ -435,6 +436,7 @@ async fn test_deadletter_config() {
             max_receives,
         }),
         sentinel_config: None,
+        retention: None,
     };
 
     let check_dlq = |asserted_len: usize| {
@@ -563,6 +565,7 @@ async fn test_deadletter_config_order() {
             max_receives,
         }),
         sentinel_config: None,
+        retention: None,
     };
 
     let check_dlq = |asserted_len: usize| {
@@ -616,6 +619,204 @@ async fn test_deadletter_config_order() {
     }
 }
 
+/// Seeds `count` entries at explicit old stream IDs (`1-0`..`count-0`, i.e.
+/// ~1970) directly via a client, in a single pipeline. All are far below any
+/// realistic `MINID` floor, so an `XADD … MINID ~ <floor>` evicts the complete
+/// old macro nodes.
+async fn seed_old_entries(conn: &mut impl redis::aio::ConnectionLike, stream: &str, count: u64) {
+    let mut pipe = redis::pipe();
+    for i in 1..=count {
+        pipe.xadd(
+            stream,
+            format!("{i}-0"),
+            &[
+                ("payload", b"old".as_ref()),
+                ("num_receives", b"0".as_ref()),
+            ],
+        )
+        .ignore();
+    }
+    let _: () = pipe.query_async(conn).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_retention_trims_old_entries_on_publish() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    seed_old_entries(&mut conn, &stream_name, 500).await;
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: None,
+        sentinel_config: None,
+        retention: Some(Duration::from_secs(1)),
+    };
+
+    let (_drop, p) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config)
+            .build_producer()
+            .await
+            .unwrap(),
+    );
+
+    p.send_raw(b"new").await.unwrap();
+
+    // The oldest seeded entry sits in a fully-expired macro node -> evicted.
+    let old: redis::streams::StreamRangeReply =
+        conn.xrange(&stream_name, "1-0", "1-0").await.unwrap();
+    assert!(old.ids.is_empty(), "old entry 1-0 should have been trimmed");
+
+    // Trimming happened (we seeded 500) and the new entry survives.
+    let len: usize = conn.xlen(&stream_name).await.unwrap();
+    assert!((1..500).contains(&len), "expected trim, got XLEN={len}");
+}
+
+#[tokio::test]
+async fn test_retention_trims_on_dlq_redrive() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+    let dlq_key: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    seed_old_entries(&mut conn, &stream_name, 500).await;
+
+    // One payload waiting on the DLQ list to be redriven onto the main stream.
+    let _: () = conn.rpush(&dlq_key, b"redriven".as_ref()).await.unwrap();
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: Some(DeadLetterQueueConfig {
+            queue_key: dlq_key.clone(),
+            max_receives: 5,
+        }),
+        sentinel_config: None,
+        retention: Some(Duration::from_secs(1)),
+    };
+
+    let (_drop, p) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config)
+            .build_producer()
+            .await
+            .unwrap(),
+    );
+
+    p.redrive_dlq().await.unwrap();
+
+    let old: redis::streams::StreamRangeReply =
+        conn.xrange(&stream_name, "1-0", "1-0").await.unwrap();
+    assert!(old.ids.is_empty(), "redrive append should trim old entries");
+    let len: usize = conn.xlen(&stream_name).await.unwrap();
+    assert!(
+        (1..500).contains(&len),
+        "expected trim on redrive, got XLEN={len}"
+    );
+
+    // Clean up the DLQ key (not covered by RedisStreamDrop).
+    let _: () = conn.del(&dlq_key).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_retention_trims_on_delayed_promotion() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    seed_old_entries(&mut conn, &stream_name, 500).await;
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: None,
+        sentinel_config: None,
+        retention: Some(Duration::from_secs(1)),
+    };
+
+    let (_drop, p) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config)
+            .build_producer()
+            .await
+            .unwrap(),
+    );
+
+    // Scheduled send lands in the delayed zset; only its promotion to the main
+    // stream goes through add_to_main_queue (and thus the MINID trim).
+    p.send_raw_scheduled(b"delayed", Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    // Poll until the old entry is trimmed by the promotion append.
+    let mut trimmed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let old: redis::streams::StreamRangeReply =
+            conn.xrange(&stream_name, "1-0", "1-0").await.unwrap();
+        if old.ids.is_empty() {
+            trimmed = true;
+            break;
+        }
+    }
+    assert!(trimmed, "delayed promotion should trim old entries");
+    let len: usize = conn.xlen(&stream_name).await.unwrap();
+    assert!(
+        (1..500).contains(&len),
+        "expected trim on promotion, got XLEN={len}"
+    );
+}
+
 // A message without a `num_receives` field shouldn't
 // cause issues:
 #[tokio::test]
@@ -654,6 +855,7 @@ async fn test_backward_compatible() {
             max_receives,
         }),
         sentinel_config: None,
+        retention: None,
     };
 
     let (builder, _drop) = (
@@ -691,4 +893,184 @@ async fn test_backward_compatible() {
         .await
         .unwrap();
     assert!(delivery.is_empty());
+}
+
+#[tokio::test]
+async fn test_retention_none_does_not_trim() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    // A single old entry is enough: with no MINID clause nothing is ever trimmed.
+    seed_old_entries(&mut conn, &stream_name, 1).await;
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: None,
+        sentinel_config: None,
+        retention: None,
+    };
+
+    let (_drop, p) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config)
+            .build_producer()
+            .await
+            .unwrap(),
+    );
+
+    p.send_raw(b"new").await.unwrap();
+
+    // Old entry untouched, both entries present: bit-for-bit legacy behavior.
+    let old: redis::streams::StreamRangeReply =
+        conn.xrange(&stream_name, "1-0", "1-0").await.unwrap();
+    assert_eq!(old.ids.len(), 1, "retention None must not trim");
+    let len: usize = conn.xlen(&stream_name).await.unwrap();
+    assert_eq!(len, 2, "expected old + new, got XLEN={len}");
+}
+
+#[tokio::test]
+async fn test_retention_preserves_payload_roundtrip() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: None,
+        sentinel_config: None,
+        retention: Some(Duration::from_secs(60)),
+    };
+
+    let (_drop, (p, mut c)) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config).build_pair().await.unwrap(),
+    );
+
+    let payload = ExType { a: 7 };
+    p.send_serde_json(&payload).await.unwrap();
+
+    let d = c.receive().await.unwrap();
+    assert_eq!(d.payload_serde_json::<ExType>().unwrap().unwrap(), payload);
+    d.ack().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_retention_trims_on_pending_reinsert() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    // Create the stream empty; group reads only entries added after creation.
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    // Old, far-expired entries that the consumer group will NOT deliver
+    // (they predate the fresh entry; we never read them via the group).
+    seed_old_entries(&mut conn, &stream_name, 500).await;
+
+    // Move the group's last-delivered-id past the old batch so receive() only
+    // ever returns the fresh entry we add next.
+    let _: () = redis::cmd("XGROUP")
+        .arg("SETID")
+        .arg(&stream_name)
+        .arg("test_cg")
+        .arg("$")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // Fresh entry (id ~now, above any MINID floor) to be claimed-and-reinserted.
+    let _: () = conn
+        .xadd(
+            &stream_name,
+            "*",
+            &[
+                ("payload", b"fresh".as_ref()),
+                ("num_receives", b"0".as_ref()),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 100,
+        dlq_config: None,
+        sentinel_config: None,
+        retention: Some(Duration::from_secs(1)),
+    };
+
+    let (_drop, mut c) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config)
+            .build_consumer()
+            .await
+            .unwrap(),
+    );
+
+    // Claim the fresh entry into the PEL and let it time out (do NOT ack).
+    let _delivery = c.receive().await.unwrap();
+
+    // The pending task reclaims it after ack_deadline and reinserts it with a
+    // MINID trim, evicting the old batch.
+    let mut trimmed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let old: redis::streams::StreamRangeReply =
+            conn.xrange(&stream_name, "1-0", "1-0").await.unwrap();
+        if old.ids.is_empty() {
+            trimmed = true;
+            break;
+        }
+    }
+    assert!(trimmed, "pending reinsert should trim old entries");
+
+    // The reinserted entry must still be readable after the trim.
+    let len: usize = conn.xlen(&stream_name).await.unwrap();
+    assert!(len >= 1, "reinserted entry should survive retention trim");
 }
