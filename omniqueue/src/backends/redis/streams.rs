@@ -42,9 +42,11 @@ fn minid_floor(retention: Duration) -> u64 {
 /// Appends one `XADD` record onto `cmd`:
 /// `key [MINID ~ <floor>] * <payload_key> <payload> num_receives <n>`.
 ///
-/// Built on a `redis::Cmd` so the same layout serves a single command
-/// (`Cmd::query_async`) and, later, pipelined appends
-/// (`Pipeline::add_command`). `internal` is passed by reference so
+/// `minid` is the precomputed [`minid_floor`] (or `None` to skip trimming).
+/// Callers compute it once per send/batch rather than per record, so a pipeline
+/// of N appends does not invoke the clock N times. Built on a `redis::Cmd` so
+/// the same layout serves a single command (`Cmd::query_async`) and pipelined
+/// appends (`Pipeline::add_command`). `internal` is passed by reference so
 /// `num_receives` is preserved (0 for fresh sends, the original count on
 /// reinsert) — never hardcoded.
 fn push_xadd(
@@ -52,11 +54,11 @@ fn push_xadd(
     key: &str,
     payload_key: &str,
     internal: &InternalPayload<'_>,
-    retention: Option<Duration>,
+    minid: Option<u64>,
 ) {
     cmd.arg(key);
-    if let Some(retention) = retention {
-        cmd.arg(MINID).arg(APPROX).arg(minid_floor(retention));
+    if let Some(minid) = minid {
+        cmd.arg(MINID).arg(APPROX).arg(minid);
     }
     cmd.arg(GENERATE_STREAM_ID)
         .arg(payload_key)
@@ -81,7 +83,7 @@ pub(super) async fn send_raw<R: RedisConnection>(
         &producer.queue_key,
         producer.payload_key.as_str(),
         &InternalPayload::new(payload),
-        producer.retention,
+        producer.retention.map(minid_floor),
     );
     let _: () = cmd
         .query_async(&mut *conn)
@@ -275,13 +277,15 @@ pub(super) async fn add_to_main_queue(
     retention: Option<Duration>,
 ) -> Result<()> {
     let mut pipe = redis::pipe();
+    // Compute the trim floor once for the whole batch, not per entry.
+    let minid = retention.map(minid_floor);
     // We don't care about existing `num_receives`
     // since we're pushing onto a different queue.
     for InternalPayload { payload, .. } in keys {
         // So reset it to avoid carrying state over:
         let internal = InternalPayload::new(payload);
         let mut cmd = redis::cmd("XADD");
-        push_xadd(&mut cmd, main_queue_name, payload_key, &internal, retention);
+        push_xadd(&mut cmd, main_queue_name, payload_key, &internal, minid);
         pipe.add_command(cmd);
     }
 
@@ -418,6 +422,8 @@ async fn reenqueue_timed_out_messages<R: RedisConnection>(
         trace!("Moving {} unhandled messages back to the queue", ids.len());
 
         let mut pipe = redis::pipe();
+        // Compute the trim floor once for the whole batch, not per entry.
+        let minid = retention.map(minid_floor);
 
         // And reinsert the map of KV pairs into the MAIN queue with a new stream ID
         for stream_id in &ids {
@@ -448,7 +454,7 @@ async fn reenqueue_timed_out_messages<R: RedisConnection>(
                 num_receives,
             };
             let mut cmd = redis::cmd("XADD");
-            push_xadd(&mut cmd, main_queue_name, payload_key, &internal, retention);
+            push_xadd(&mut cmd, main_queue_name, payload_key, &internal, minid);
             pipe.add_command(cmd);
         }
 
