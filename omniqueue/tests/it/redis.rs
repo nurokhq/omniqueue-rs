@@ -766,3 +766,95 @@ async fn test_backward_compatible() {
         .unwrap();
     assert!(delivery.is_empty());
 }
+
+#[tokio::test]
+async fn test_retention_none_does_not_trim() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    // A single old entry is enough: with no MINID clause nothing is ever trimmed.
+    seed_old_entries(&mut conn, &stream_name, 1).await;
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: None,
+        sentinel_config: None,
+        retention: None,
+    };
+
+    let (_drop, p) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config)
+            .build_producer()
+            .await
+            .unwrap(),
+    );
+
+    p.send_raw(b"new").await.unwrap();
+
+    // Old entry untouched, both entries present: bit-for-bit legacy behavior.
+    let old: redis::streams::StreamRangeReply =
+        conn.xrange(&stream_name, "1-0", "1-0").await.unwrap();
+    assert_eq!(old.ids.len(), 1, "retention None must not trim");
+    let len: usize = conn.xlen(&stream_name).await.unwrap();
+    assert_eq!(len, 2, "expected old + new, got XLEN={len}");
+}
+
+#[tokio::test]
+async fn test_retention_preserves_payload_roundtrip() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: None,
+        sentinel_config: None,
+        retention: Some(Duration::from_secs(60)),
+    };
+
+    let (_drop, (p, mut c)) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config).build_pair().await.unwrap(),
+    );
+
+    let payload = ExType { a: 7 };
+    p.send_serde_json(&payload).await.unwrap();
+
+    let d = c.receive().await.unwrap();
+    assert_eq!(d.payload_serde_json::<ExType>().unwrap().unwrap(), payload);
+    d.ack().await.unwrap();
+}
