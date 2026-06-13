@@ -272,9 +272,9 @@ pub struct RedisConfig {
     pub sentinel_config: Option<SentinelConfig>,
     /// Opt-in, per-queue time-based retention window for the Redis **Streams**
     /// backend. When `Some`, every append to the main queue carries an atomic
-    /// `XADD … MINID ~ <now − retention>` clause so entries age out automatically.
-    /// `None` preserves the untrimmed behavior bit-for-bit. Ignored by the
-    /// list/fallback backend (`RPUSH` has no `MINID`).
+    /// `XADD … MINID ~ <now − retention>` clause so entries age out
+    /// automatically. `None` preserves the untrimmed behavior bit-for-bit.
+    /// Ignored by the list/fallback backend (`RPUSH` has no `MINID`).
     pub retention: Option<Duration>,
 }
 

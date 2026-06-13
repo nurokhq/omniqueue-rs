@@ -619,9 +619,10 @@ async fn test_deadletter_config_order() {
     }
 }
 
-/// Seeds `count` entries at explicit old stream IDs (`1-0`..`count-0`, i.e. ~1970)
-/// directly via a client, in a single pipeline. All are far below any realistic
-/// `MINID` floor, so an `XADD … MINID ~ <floor>` evicts the complete old macro nodes.
+/// Seeds `count` entries at explicit old stream IDs (`1-0`..`count-0`, i.e.
+/// ~1970) directly via a client, in a single pipeline. All are far below any
+/// realistic `MINID` floor, so an `XADD … MINID ~ <floor>` evicts the complete
+/// old macro nodes.
 async fn seed_old_entries(conn: &mut impl redis::aio::ConnectionLike, stream: &str, count: u64) {
     let mut pipe = redis::pipe();
     for i in 1..=count {

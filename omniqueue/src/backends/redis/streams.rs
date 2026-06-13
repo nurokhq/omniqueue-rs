@@ -43,9 +43,10 @@ fn minid_floor(retention: Duration) -> u64 {
 /// `key [MINID ~ <floor>] * <payload_key> <payload> num_receives <n>`.
 ///
 /// Built on a `redis::Cmd` so the same layout serves a single command
-/// (`Cmd::query_async`) and, later, pipelined appends (`Pipeline::add_command`).
-/// `internal` is passed by reference so `num_receives` is preserved (0 for fresh
-/// sends, the original count on reinsert) — never hardcoded.
+/// (`Cmd::query_async`) and, later, pipelined appends
+/// (`Pipeline::add_command`). `internal` is passed by reference so
+/// `num_receives` is preserved (0 for fresh sends, the original count on
+/// reinsert) — never hardcoded.
 fn push_xadd(
     cmd: &mut redis::Cmd,
     key: &str,
