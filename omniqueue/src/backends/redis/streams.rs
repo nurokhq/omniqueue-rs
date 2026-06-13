@@ -283,6 +283,7 @@ pub(super) async fn add_to_main_queue(
     main_queue_name: &str,
     payload_key: &str,
     conn: &mut impl redis::aio::ConnectionLike,
+    retention: Option<Duration>,
 ) -> Result<()> {
     let mut pipe = redis::pipe();
     // We don't care about existing `num_receives`
@@ -290,11 +291,9 @@ pub(super) async fn add_to_main_queue(
     for InternalPayload { payload, .. } in keys {
         // So reset it to avoid carrying state over:
         let internal = InternalPayload::new(payload);
-        let _ = pipe.xadd(
-            main_queue_name,
-            GENERATE_STREAM_ID,
-            internal_to_stream_payload!(internal, payload_key),
-        );
+        let mut cmd = redis::cmd("XADD");
+        push_xadd(&mut cmd, main_queue_name, payload_key, &internal, retention);
+        pipe.add_command(cmd);
     }
 
     let _: () = pipe.query_async(conn).await.map_err(QueueError::generic)?;

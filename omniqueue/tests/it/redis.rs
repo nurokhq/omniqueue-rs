@@ -689,6 +689,133 @@ async fn test_retention_trims_old_entries_on_publish() {
     assert!((1..500).contains(&len), "expected trim, got XLEN={len}");
 }
 
+#[tokio::test]
+async fn test_retention_trims_on_dlq_redrive() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+    let dlq_key: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    seed_old_entries(&mut conn, &stream_name, 500).await;
+
+    // One payload waiting on the DLQ list to be redriven onto the main stream.
+    let _: () = conn.rpush(&dlq_key, b"redriven".as_ref()).await.unwrap();
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: Some(DeadLetterQueueConfig {
+            queue_key: dlq_key.clone(),
+            max_receives: 5,
+        }),
+        sentinel_config: None,
+        retention: Some(Duration::from_secs(1)),
+    };
+
+    let (_drop, p) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config)
+            .build_producer()
+            .await
+            .unwrap(),
+    );
+
+    p.redrive_dlq().await.unwrap();
+
+    let old: redis::streams::StreamRangeReply =
+        conn.xrange(&stream_name, "1-0", "1-0").await.unwrap();
+    assert!(old.ids.is_empty(), "redrive append should trim old entries");
+    let len: usize = conn.xlen(&stream_name).await.unwrap();
+    assert!(
+        (1..500).contains(&len),
+        "expected trim on redrive, got XLEN={len}"
+    );
+
+    // Clean up the DLQ key (not covered by RedisStreamDrop).
+    let _: () = conn.del(&dlq_key).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_retention_trims_on_delayed_promotion() {
+    let stream_name: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(8)
+        .collect();
+
+    let client = Client::open(ROOT_URL).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = conn
+        .xgroup_create_mkstream(&stream_name, "test_cg", 0i8)
+        .await
+        .unwrap();
+
+    seed_old_entries(&mut conn, &stream_name, 500).await;
+
+    let config = RedisConfig {
+        dsn: ROOT_URL.to_owned(),
+        max_connections: 8,
+        reinsert_on_nack: false,
+        queue_key: stream_name.clone(),
+        delayed_queue_key: format!("{stream_name}::delayed"),
+        delayed_lock_key: format!("{stream_name}::delayed_lock"),
+        consumer_group: "test_cg".to_owned(),
+        consumer_name: "test_cn".to_owned(),
+        payload_key: "payload".to_owned(),
+        ack_deadline_ms: 5_000,
+        dlq_config: None,
+        sentinel_config: None,
+        retention: Some(Duration::from_secs(1)),
+    };
+
+    let (_drop, p) = (
+        RedisStreamDrop(stream_name.clone()),
+        RedisBackend::builder(config)
+            .build_producer()
+            .await
+            .unwrap(),
+    );
+
+    // Scheduled send lands in the delayed zset; only its promotion to the main
+    // stream goes through add_to_main_queue (and thus the MINID trim).
+    p.send_raw_scheduled(b"delayed", Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    // Poll until the old entry is trimmed by the promotion append.
+    let mut trimmed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let old: redis::streams::StreamRangeReply =
+            conn.xrange(&stream_name, "1-0", "1-0").await.unwrap();
+        if old.ids.is_empty() {
+            trimmed = true;
+            break;
+        }
+    }
+    assert!(trimmed, "delayed promotion should trim old entries");
+    let len: usize = conn.xlen(&stream_name).await.unwrap();
+    assert!(
+        (1..500).contains(&len),
+        "expected trim on promotion, got XLEN={len}"
+    );
+}
+
 // A message without a `num_receives` field shouldn't
 // cause issues:
 #[tokio::test]

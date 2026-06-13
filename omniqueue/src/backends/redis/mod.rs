@@ -538,6 +538,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
                 let delayed_lock_key = self.config.delayed_lock_key.to_owned();
                 let payload_key = self.config.payload_key.to_owned();
                 let use_redis_streams = self.use_redis_streams;
+                let retention = self.config.retention;
 
                 #[rustfmt::skip]
                 debug!(
@@ -554,6 +555,7 @@ impl<R: RedisConnection> RedisBackendBuilder<R> {
                             &delayed_lock_key,
                             &payload_key,
                             use_redis_streams,
+                            retention,
                         )
                         .await
                         {
@@ -628,6 +630,7 @@ async fn background_task_delayed<R: RedisConnection>(
     delayed_lock: &str,
     payload_key: &str,
     use_redis_streams: bool,
+    retention: Option<Duration>,
 ) -> Result<()> {
     const BATCH_SIZE: isize = 50;
 
@@ -674,8 +677,14 @@ async fn background_task_delayed<R: RedisConnection>(
             );
 
             if use_redis_streams {
-                streams::add_to_main_queue(new_keys, main_queue_name, payload_key, &mut *conn)
-                    .await?;
+                streams::add_to_main_queue(
+                    new_keys,
+                    main_queue_name,
+                    payload_key,
+                    &mut *conn,
+                    retention,
+                )
+                .await?;
             } else {
                 fallback::add_to_main_queue(new_keys, main_queue_name, &mut *conn).await?;
             }
@@ -797,6 +806,7 @@ impl<R: RedisConnection> RedisProducer<R> {
                     &self.queue_key,
                     &self.payload_key,
                     &mut *conn,
+                    self.retention,
                 )
                 .await?;
             } else {
