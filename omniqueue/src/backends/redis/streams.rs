@@ -430,7 +430,23 @@ async fn reenqueue_timed_out_messages<R: RedisConnection>(
             let InternalPayloadOwned {
                 payload,
                 num_receives,
-            } = internal_from_stream(stream_id, payload_key)?;
+            } = match internal_from_stream(stream_id, payload_key) {
+                Ok(internal) => internal,
+                // The entry has no fields — it was trimmed (e.g. by a retention
+                // `MINID` append) while still pending. Skip the reinsert; the
+                // trailing XACK/XDEL below still clears its PEL ref so the group
+                // doesn't get stuck re-claiming a vanished entry. Redis 7.0+
+                // drops such entries from XAUTOCLAIM automatically; this also
+                // guards 6.2, which does not.
+                Err(QueueError::NoData) => {
+                    trace!(
+                        entry_id = stream_id.id,
+                        "pending entry trimmed; dropping stale PEL ref"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             if let Some(dlq_config) = &dlq_config {
                 if num_receives >= dlq_config.max_receives {
